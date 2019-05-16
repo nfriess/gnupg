@@ -53,6 +53,8 @@
 #include <ucred.h>
 #endif
 
+#include <u2f-host.h>
+
 #include "agent.h"
 
 #include "../common/i18n.h"
@@ -71,6 +73,9 @@
 #define SSH_REQUEST_LOCK                  22
 #define SSH_REQUEST_UNLOCK                23
 #define SSH_REQUEST_ADD_ID_CONSTRAINED    25
+
+#define SSH_REQUEST_U2F_REGISTER          40
+#define SSH_REQUEST_U2F_AUTHENTICATE      41
 
 /* Options. */
 #define	SSH_OPT_CONSTRAIN_LIFETIME	   1
@@ -250,6 +255,12 @@ static gpg_error_t ssh_handler_lock (ctrl_t ctrl,
 static gpg_error_t ssh_handler_unlock (ctrl_t ctrl,
 				       estream_t request,
 				       estream_t response);
+static gpg_error_t ssh_handler_u2f_register (ctrl_t ctrl,
+					     estream_t request,
+					     estream_t response);
+static gpg_error_t ssh_handler_u2f_authenticate (ctrl_t ctrl,
+						 estream_t request,
+						 estream_t response);
 
 static gpg_error_t ssh_key_modifier_rsa (const char *elems, gcry_mpi_t *mpis);
 static gpg_error_t ssh_signature_encoder_rsa (ssh_key_type_spec_t *spec,
@@ -286,7 +297,9 @@ static const ssh_request_spec_t request_specs[] =
     REQUEST_SPEC_DEFINE (REMOVE_IDENTITY,       remove_identity,       0),
     REQUEST_SPEC_DEFINE (REMOVE_ALL_IDENTITIES, remove_all_identities, 0),
     REQUEST_SPEC_DEFINE (LOCK,                  lock,                  0),
-    REQUEST_SPEC_DEFINE (UNLOCK,                unlock,                0)
+    REQUEST_SPEC_DEFINE (UNLOCK,                unlock,                0),
+    REQUEST_SPEC_DEFINE (U2F_REGISTER,          u2f_register,          0),
+    REQUEST_SPEC_DEFINE (U2F_AUTHENTICATE,      u2f_authenticate,      0)
 #undef REQUEST_SPEC_DEFINE
   };
 
@@ -3400,6 +3413,197 @@ ssh_handler_unlock (ctrl_t ctrl, estream_t request, estream_t response)
     ret_err = stream_write_byte (response, SSH_RESPONSE_FAILURE);
 
   return ret_err;
+}
+
+/* Handler for the "u2f_register" command.  */
+static gpg_error_t
+ssh_handler_u2f_register (ctrl_t ctrl, estream_t request, estream_t response)
+{
+  unsigned char *origin;
+  u32 origin_size;
+  unsigned char *registration_challenge;
+  u32 reg_chal_size;
+  char *registration_response;
+  u32 reg_resp_size;
+  u2fh_devs *devs = NULL;
+  unsigned max_index = 0;
+  u2fh_rc h_rc;
+  gpg_error_t ret_err;
+  gpg_error_t err;
+
+  (void)ctrl;
+
+  ret_err = 0;
+
+  /* Receive origin and challenge string.  */
+
+  origin = NULL;
+  origin_size = 0;
+  registration_challenge = NULL;
+  reg_chal_size = 0;
+  registration_response = NULL;
+  reg_resp_size = 0;
+
+  log_info ("u2f_register started\n");
+
+  err = stream_read_string (request, 0, &origin, &origin_size);
+  if (err)
+    goto out;
+
+  err = stream_read_string (request, 0, &registration_challenge, &reg_chal_size);
+  if (err)
+    goto out;
+
+  if (u2fh_global_init(0) != U2FH_OK ||
+      u2fh_devs_init(&devs) != U2FH_OK) {
+    log_info("Unable to initialize libu2f-host\n");
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_devs_discover(devs, &max_index);
+  if (h_rc != U2FH_OK && h_rc != U2FH_NO_U2F_DEVICE) {
+    log_info("Unable to discover device(s), %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  if (h_rc == U2FH_NO_U2F_DEVICE) {
+    // TODO: Special response?
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_register(devs, registration_challenge, origin,
+		       &registration_response, U2FH_REQUEST_USER_PRESENCE);
+  if (h_rc != U2FH_OK) {
+    log_info("Unable to register device, %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  reg_resp_size = strlen(registration_response);
+
+  /* Send registration response. */
+
+  err = stream_write_byte (response, SSH_RESPONSE_SUCCESS);
+  if (err)
+    goto out;
+
+  ret_err = stream_write_string (response, registration_response, reg_resp_size);
+
+ out:
+
+  xfree (origin);
+  xfree (registration_challenge);
+  if (registration_response)
+    free (registration_response);
+  if (devs)
+    free (devs);
+
+  if (err)
+    ret_err = stream_write_byte (response, SSH_RESPONSE_FAILURE);
+
+  return ret_err;
+
+}
+
+/* Handler for the "u2f_authenticate" command.  */
+static gpg_error_t
+ssh_handler_u2f_authenticate (ctrl_t ctrl, estream_t request, estream_t response)
+{
+  unsigned char *origin;
+  u32 origin_size;
+  unsigned char *authenticate_challenge;
+  u32 auth_chal_size;
+  char *authenticate_response;
+  u32 auth_resp_size;
+  u2fh_devs *devs = NULL;
+  unsigned max_index = 0;
+  u2fh_rc h_rc;
+  gpg_error_t ret_err;
+  gpg_error_t err;
+
+  (void)ctrl;
+
+  ret_err = 0;
+
+  /* Receive origin and challenge string.  */
+
+  origin = NULL;
+  origin_size = 0;
+  authenticate_challenge = NULL;
+  auth_chal_size = 0;
+  authenticate_response = NULL;
+  auth_resp_size = 0;
+
+  log_info ("u2f_authenticate started\n");
+
+  err = stream_read_string (request, 0, &origin, &origin_size);
+  if (err)
+    goto out;
+
+  err = stream_read_string (request, 0, &authenticate_challenge, &auth_chal_size);
+  if (err)
+    goto out;
+
+  if (u2fh_global_init(0) != U2FH_OK ||
+      u2fh_devs_init(&devs) != U2FH_OK) {
+    log_info("Unable to initialize libu2f-host\n");
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_devs_discover(devs, &max_index);
+  if (h_rc != U2FH_OK && h_rc != U2FH_NO_U2F_DEVICE) {
+    log_info("Unable to discover device(s), %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  if (h_rc == U2FH_NO_U2F_DEVICE) {
+    // TODO: Special response?
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_authenticate(devs, authenticate_challenge, origin,
+			   &authenticate_response,
+			   U2FH_REQUEST_USER_PRESENCE);
+  if (h_rc != U2FH_OK) {
+    log_info("Unable to authenticate with device, %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  auth_resp_size = strlen(authenticate_response);
+
+  /* Send authenticate response. */
+
+  err = stream_write_byte (response, SSH_RESPONSE_SUCCESS);
+  if (err)
+    goto out;
+
+  ret_err = stream_write_string (response, authenticate_response, auth_resp_size);
+
+ out:
+
+  xfree (origin);
+  xfree (authenticate_challenge);
+  if (authenticate_response)
+    free (authenticate_response);
+  if (devs)
+    free (devs);
+
+  if (err)
+    ret_err = stream_write_byte (response, SSH_RESPONSE_FAILURE);
+
+  return ret_err;
+
 }
 
 
