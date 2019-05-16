@@ -41,6 +41,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <assert.h>
 #ifndef HAVE_W32_SYSTEM
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -51,6 +52,8 @@
 #ifdef HAVE_UCRED_H
 #include <ucred.h>
 #endif
+
+#include <u2f-host.h>
 
 #include "agent.h"
 
@@ -70,6 +73,9 @@
 #define SSH_REQUEST_LOCK                  22
 #define SSH_REQUEST_UNLOCK                23
 #define SSH_REQUEST_ADD_ID_CONSTRAINED    25
+
+#define SSH_REQUEST_U2F_REGISTER          40
+#define SSH_REQUEST_U2F_AUTHENTICATE      41
 
 /* Options. */
 #define	SSH_OPT_CONSTRAIN_LIFETIME	   1
@@ -249,6 +255,12 @@ static gpg_error_t ssh_handler_lock (ctrl_t ctrl,
 static gpg_error_t ssh_handler_unlock (ctrl_t ctrl,
 				       estream_t request,
 				       estream_t response);
+static gpg_error_t ssh_handler_u2f_register (ctrl_t ctrl,
+					     estream_t request,
+					     estream_t response);
+static gpg_error_t ssh_handler_u2f_authenticate (ctrl_t ctrl,
+						 estream_t request,
+						 estream_t response);
 
 static gpg_error_t ssh_key_modifier_rsa (const char *elems, gcry_mpi_t *mpis);
 static gpg_error_t ssh_signature_encoder_rsa (ssh_key_type_spec_t *spec,
@@ -266,11 +278,6 @@ static gpg_error_t ssh_signature_encoder_eddsa (ssh_key_type_spec_t *spec,
 static gpg_error_t ssh_key_extract_comment (gcry_sexp_t key, char **comment);
 
 
-struct peer_info_s
-{
-  unsigned long pid;
-  int uid;
-};
 
 /* Global variables.  */
 
@@ -290,7 +297,9 @@ static const ssh_request_spec_t request_specs[] =
     REQUEST_SPEC_DEFINE (REMOVE_IDENTITY,       remove_identity,       0),
     REQUEST_SPEC_DEFINE (REMOVE_ALL_IDENTITIES, remove_all_identities, 0),
     REQUEST_SPEC_DEFINE (LOCK,                  lock,                  0),
-    REQUEST_SPEC_DEFINE (UNLOCK,                unlock,                0)
+    REQUEST_SPEC_DEFINE (UNLOCK,                unlock,                0),
+    REQUEST_SPEC_DEFINE (U2F_REGISTER,          u2f_register,          0),
+    REQUEST_SPEC_DEFINE (U2F_AUTHENTICATE,      u2f_authenticate,      0)
 #undef REQUEST_SPEC_DEFINE
   };
 
@@ -1029,7 +1038,7 @@ search_control_file (ssh_control_file_t cf, const char *hexgrip,
 {
   gpg_error_t err;
 
-  log_assert (strlen (hexgrip) == 40 );
+  assert (strlen (hexgrip) == 40 );
 
   if (r_disabled)
     *r_disabled = 0;
@@ -2645,7 +2654,7 @@ ssh_handler_request_identities (ctrl_t ctrl,
         continue; /* Should not happen.  */
       if (cf->item.disabled)
         continue;
-      log_assert (strlen (cf->item.hexgrip) == 40);
+      assert (strlen (cf->item.hexgrip) == 40);
       hex2bin (cf->item.hexgrip, grip, sizeof (grip));
 
       err = agent_public_key_from_file (ctrl, grip, &key_public);
@@ -2720,7 +2729,7 @@ data_hash (unsigned char *data, size_t data_n,
    allow the use of signature algorithms that implement the hashing
    internally (e.g. Ed25519).  On success the created signature is
    stored in ssh format at R_SIG and it's size at R_SIGLEN; the caller
-   must use es_free to release this memory.  */
+   must use es_free to releaase this memory.  */
 static gpg_error_t
 data_sign (ctrl_t ctrl, ssh_key_type_spec_t *spec,
            const void *hash, size_t hashlen,
@@ -3141,7 +3150,7 @@ ssh_identity_register (ctrl_t ctrl, ssh_key_type_spec_t *spec,
     goto out;
 
   /* Store this key to our key storage.  */
-  err = agent_write_private_key (key_grip_raw, buffer, buffer_n, 0, NULL, NULL);
+  err = agent_write_private_key (key_grip_raw, buffer, buffer_n, 0);
   if (err)
     goto out;
 
@@ -3406,6 +3415,197 @@ ssh_handler_unlock (ctrl_t ctrl, estream_t request, estream_t response)
   return ret_err;
 }
 
+/* Handler for the "u2f_register" command.  */
+static gpg_error_t
+ssh_handler_u2f_register (ctrl_t ctrl, estream_t request, estream_t response)
+{
+  unsigned char *origin;
+  u32 origin_size;
+  unsigned char *registration_challenge;
+  u32 reg_chal_size;
+  char *registration_response;
+  u32 reg_resp_size;
+  u2fh_devs *devs = NULL;
+  unsigned max_index = 0;
+  u2fh_rc h_rc;
+  gpg_error_t ret_err;
+  gpg_error_t err;
+
+  (void)ctrl;
+
+  ret_err = 0;
+  
+  /* Receive origin and challenge string.  */
+
+  origin = NULL;
+  origin_size = 0;
+  registration_challenge = NULL;
+  reg_chal_size = 0;
+  registration_response = NULL;
+  reg_resp_size = 0;
+ 
+  log_info ("u2f_register started\n");
+
+  err = stream_read_string (request, 0, &origin, &origin_size);
+  if (err)
+    goto out;
+
+  err = stream_read_string (request, 0, &registration_challenge, &reg_chal_size);
+  if (err)
+    goto out;
+
+  if (u2fh_global_init(0) != U2FH_OK ||
+      u2fh_devs_init(&devs) != U2FH_OK) {
+    log_info("Unable to initialize libu2f-host\n");
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_devs_discover(devs, &max_index);
+  if (h_rc != U2FH_OK && h_rc != U2FH_NO_U2F_DEVICE) {
+    log_info("Unable to discover device(s), %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  if (h_rc == U2FH_NO_U2F_DEVICE) {
+    // TODO: Special response?
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_register(devs, registration_challenge, origin,
+		       &registration_response, U2FH_REQUEST_USER_PRESENCE);
+  if (h_rc != U2FH_OK) {
+    log_info("Unable to register device, %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  reg_resp_size = strlen(registration_response);
+
+  /* Send registration response. */
+
+  err = stream_write_byte (response, SSH_RESPONSE_SUCCESS);
+  if (err)
+    goto out;
+   
+  ret_err = stream_write_string (response, registration_response, reg_resp_size);
+    
+ out:
+
+  xfree (origin);
+  xfree (registration_challenge);
+  if (registration_response)
+    free (registration_response);
+  if (devs)
+    free (devs);
+
+  if (err)
+    ret_err = stream_write_byte (response, SSH_RESPONSE_FAILURE);
+
+  return ret_err;
+ 
+}
+
+/* Handler for the "u2f_authenticate" command.  */
+static gpg_error_t
+ssh_handler_u2f_authenticate (ctrl_t ctrl, estream_t request, estream_t response)
+{
+  unsigned char *origin;
+  u32 origin_size;
+  unsigned char *authenticate_challenge;
+  u32 auth_chal_size;
+  char *authenticate_response;
+  u32 auth_resp_size;
+  u2fh_devs *devs = NULL;
+  unsigned max_index = 0;
+  u2fh_rc h_rc;
+  gpg_error_t ret_err;
+  gpg_error_t err;
+
+  (void)ctrl;
+
+  ret_err = 0;
+
+  /* Receive origin and challenge string.  */
+
+  origin = NULL;
+  origin_size = 0;
+  authenticate_challenge = NULL;
+  auth_chal_size = 0;
+  authenticate_response = NULL;
+  auth_resp_size = 0;
+ 
+  log_info ("u2f_authenticate started\n");
+
+  err = stream_read_string (request, 0, &origin, &origin_size);
+  if (err)
+    goto out;
+
+  err = stream_read_string (request, 0, &authenticate_challenge, &auth_chal_size);
+  if (err)
+    goto out;
+
+  if (u2fh_global_init(0) != U2FH_OK ||
+      u2fh_devs_init(&devs) != U2FH_OK) {
+    log_info("Unable to initialize libu2f-host\n");
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_devs_discover(devs, &max_index);
+  if (h_rc != U2FH_OK && h_rc != U2FH_NO_U2F_DEVICE) {
+    log_info("Unable to discover device(s), %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  if (h_rc == U2FH_NO_U2F_DEVICE) {
+    // TODO: Special response?
+    err = 1;
+    goto out;
+  }
+
+  h_rc = u2fh_authenticate(devs, authenticate_challenge, origin,
+			   &authenticate_response,
+			   U2FH_REQUEST_USER_PRESENCE);
+  if (h_rc != U2FH_OK) {
+    log_info("Unable to authenticate with device, %s (%d)\n",
+            u2fh_strerror(h_rc), h_rc);
+    err = 1;
+    goto out;
+  }
+
+  auth_resp_size = strlen(authenticate_response);
+
+  /* Send authenticate response. */
+
+  err = stream_write_byte (response, SSH_RESPONSE_SUCCESS);
+  if (err)
+    goto out;
+   
+  ret_err = stream_write_string (response, authenticate_response, auth_resp_size);
+
+ out:
+
+  xfree (origin);
+  xfree (authenticate_challenge);
+  if (authenticate_response)
+    free (authenticate_response);
+  if (devs)
+    free (devs);
+
+  if (err)
+    ret_err = stream_write_byte (response, SSH_RESPONSE_FAILURE);
+
+  return ret_err;
+
+}
+
 
 
 /* Return the request specification for the request identified by TYPE
@@ -3591,11 +3791,10 @@ ssh_request_process (ctrl_t ctrl, estream_t stream_sock)
 
 
 /* Return the peer's pid.  */
-static void
-get_client_info (int fd, struct peer_info_s *out)
+static unsigned long
+get_client_pid (int fd)
 {
-  pid_t client_pid = (pid_t)(-1);
-  int client_uid = -1;
+  pid_t client_pid = (pid_t)0;
 
 #ifdef SO_PEERCRED
   {
@@ -3610,10 +3809,8 @@ get_client_info (int fd, struct peer_info_s *out)
       {
 #if defined (HAVE_STRUCT_SOCKPEERCRED_PID) || defined (HAVE_STRUCT_UCRED_PID)
         client_pid = cr.pid;
-        client_uid = (int)cr.uid;
 #elif defined (HAVE_STRUCT_UCRED_CR_PID)
         client_pid = cr.cr_pid;
-        client_uid = (int)cr.cr_uid;
 #else
 #error "Unknown SO_PEERCRED struct"
 #endif
@@ -3624,15 +3821,6 @@ get_client_info (int fd, struct peer_info_s *out)
     socklen_t len = sizeof (pid_t);
 
     getsockopt (fd, SOL_LOCAL, LOCAL_PEERPID, &client_pid, &len);
-#if defined (LOCAL_PEERCRED)
-    {
-      struct xucred cr;
-      len = sizeof (struct xucred);
-
-      if (!getsockopt (fd, SOL_LOCAL, LOCAL_PEERCRED, &cr, &len))
-	client_uid = (int)cr.cr_uid;
-    }
-#endif
   }
 #elif defined (LOCAL_PEEREID)
   {
@@ -3640,10 +3828,7 @@ get_client_info (int fd, struct peer_info_s *out)
     socklen_t unpl = sizeof unp;
 
     if (getsockopt (fd, 0, LOCAL_PEEREID, &unp, &unpl) != -1)
-      {
-        client_pid = unp.unp_pid;
-        client_uid = (int)unp.unp_euid;
-      }
+      client_pid = unp.unp_pid;
   }
 #elif defined (HAVE_GETPEERUCRED)
   {
@@ -3651,8 +3836,7 @@ get_client_info (int fd, struct peer_info_s *out)
 
     if (getpeerucred (fd, &ucred) != -1)
       {
-        client_pid = ucred_getpid (ucred);
-	client_uid = (int)ucred_geteuid (ucred);
+        client_pid= ucred_getpid (ucred);
         ucred_free (ucred);
       }
   }
@@ -3660,8 +3844,7 @@ get_client_info (int fd, struct peer_info_s *out)
   (void)fd;
 #endif
 
-  out->pid = (client_pid == (pid_t)(-1)? 0 : (unsigned long)client_pid);
-  out->uid = client_uid;
+  return (unsigned long)client_pid;
 }
 
 
@@ -3672,15 +3855,14 @@ start_command_handler_ssh (ctrl_t ctrl, gnupg_fd_t sock_client)
   estream_t stream_sock = NULL;
   gpg_error_t err;
   int ret;
-  struct peer_info_s peer_info;
+
+  log_info("start_command_handler_ssh\n");
 
   err = agent_copy_startup_env (ctrl);
   if (err)
     goto out;
 
-  get_client_info (FD2INT(sock_client), &peer_info);
-  ctrl->client_pid = peer_info.pid;
-  ctrl->client_uid = peer_info.uid;
+  ctrl->client_pid = get_client_pid (FD2INT(sock_client));
 
   /* Create stream from socket.  */
   stream_sock = es_fdopen (FD2INT(sock_client), "r+");
@@ -3691,6 +3873,7 @@ start_command_handler_ssh (ctrl_t ctrl, gnupg_fd_t sock_client)
 		 gpg_strerror (err));
       goto out;
     }
+  
   /* We have to disable the estream buffering, because the estream
      core doesn't know about secure memory.  */
   ret = es_setvbuf (stream_sock, NULL, _IONBF, 0);
