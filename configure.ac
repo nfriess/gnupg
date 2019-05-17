@@ -2088,7 +2088,6 @@ echo "
         TLS support:         $use_tls_library
         TOFU support:        $use_tofu
         Tor support:         $show_tor_support
-
 "
 if test x"$use_regex" != xyes ; then
 echo "
