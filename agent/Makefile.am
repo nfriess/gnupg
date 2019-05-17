@@ -65,11 +65,11 @@ endif
 
 
 gpg_agent_CFLAGS = $(AM_CFLAGS) $(LIBASSUAN_CFLAGS) $(NPTH_CFLAGS) \
-		$(INCICONV)
+		$(INCICONV) $(u2f_host_CFLAGS)
 gpg_agent_LDADD = $(commonpth_libs) \
                 $(LIBGCRYPT_LIBS) $(LIBASSUAN_LIBS) $(NPTH_LIBS) \
 	        $(GPG_ERROR_LIBS) $(LIBINTL) $(NETLIBS) $(LIBICONV) \
-		$(resource_objs)
+		$(resource_objs) $(u2f_host_LIBS)
 gpg_agent_LDFLAGS = $(extra_bin_ldflags)
 gpg_agent_DEPENDENCIES = $(resource_objs)
 

@@ -52,8 +52,9 @@
 #ifdef HAVE_UCRED_H
 #include <ucred.h>
 #endif
-
+#ifdef ENABLE_SSH_AGENT_U2F
 #include <u2f-host.h>
+#endif
 
 #include "agent.h"
 
@@ -74,8 +75,10 @@
 #define SSH_REQUEST_UNLOCK                23
 #define SSH_REQUEST_ADD_ID_CONSTRAINED    25
 
+#ifdef ENABLE_SSH_AGENT_U2F
 #define SSH_REQUEST_U2F_REGISTER          40
 #define SSH_REQUEST_U2F_AUTHENTICATE      41
+#endif
 
 /* Options. */
 #define	SSH_OPT_CONSTRAIN_LIFETIME	   1
@@ -255,13 +258,14 @@ static gpg_error_t ssh_handler_lock (ctrl_t ctrl,
 static gpg_error_t ssh_handler_unlock (ctrl_t ctrl,
 				       estream_t request,
 				       estream_t response);
+#ifdef ENABLE_SSH_AGENT_U2F
 static gpg_error_t ssh_handler_u2f_register (ctrl_t ctrl,
 					     estream_t request,
 					     estream_t response);
 static gpg_error_t ssh_handler_u2f_authenticate (ctrl_t ctrl,
 						 estream_t request,
 						 estream_t response);
-
+#endif
 static gpg_error_t ssh_key_modifier_rsa (const char *elems, gcry_mpi_t *mpis);
 static gpg_error_t ssh_signature_encoder_rsa (ssh_key_type_spec_t *spec,
                                               estream_t signature_blob,
@@ -298,8 +302,10 @@ static const ssh_request_spec_t request_specs[] =
     REQUEST_SPEC_DEFINE (REMOVE_ALL_IDENTITIES, remove_all_identities, 0),
     REQUEST_SPEC_DEFINE (LOCK,                  lock,                  0),
     REQUEST_SPEC_DEFINE (UNLOCK,                unlock,                0),
+#ifdef ENABLE_SSH_AGENT_U2F
     REQUEST_SPEC_DEFINE (U2F_REGISTER,          u2f_register,          0),
     REQUEST_SPEC_DEFINE (U2F_AUTHENTICATE,      u2f_authenticate,      0)
+#endif
 #undef REQUEST_SPEC_DEFINE
   };
 
@@ -3415,6 +3421,7 @@ ssh_handler_unlock (ctrl_t ctrl, estream_t request, estream_t response)
   return ret_err;
 }
 
+#ifdef ENABLE_SSH_AGENT_U2F
 /* Handler for the "u2f_register" command.  */
 static gpg_error_t
 ssh_handler_u2f_register (ctrl_t ctrl, estream_t request, estream_t response)
@@ -3605,6 +3612,7 @@ ssh_handler_u2f_authenticate (ctrl_t ctrl, estream_t request, estream_t response
   return ret_err;
 
 }
+#endif /*ENABLE_SSH_AGENT_U2F*/
 
 
 

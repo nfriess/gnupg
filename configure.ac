@@ -1768,6 +1768,21 @@ fi
 
 
 #
+# Enable SSH Agent U2F support
+#
+AC_ARG_ENABLE(ssh-agent-u2f,
+    AC_HELP_STRING([--enable-ssh-agent-u2f],
+                   [enable forwarding of u2f requests through SSH Agent]),
+    enable_ssh_agent_u2f=$enableval)
+if test x"$enable_ssh_agent_u2f" = x"yes"; then
+   PKG_CHECK_MODULES([u2f_host], [u2f-host], [], [])
+   AC_DEFINE(ENABLE_SSH_AGENT_U2F, 1,
+             [If defined then SSH Agent will support forwarding U2F calls])
+fi
+AM_CONDITIONAL(ENABLE_SSH_AGENT_U2F, test "$enable_ssh_agent_u2f" = yes)
+
+
+#
 # Decide what to build
 #
 
@@ -2073,6 +2088,7 @@ echo "
         TLS support:         $use_tls_library
         TOFU support:        $use_tofu
         Tor support:         $show_tor_support
+
 "
 if test x"$use_regex" != xyes ; then
 echo "
