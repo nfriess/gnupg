@@ -1779,7 +1779,6 @@ if test x"$enable_ssh_agent_u2f" = x"yes"; then
    AC_DEFINE(ENABLE_SSH_AGENT_U2F, 1,
              [If defined then SSH Agent will support forwarding U2F calls])
 fi
-AM_CONDITIONAL(ENABLE_SSH_AGENT_U2F, test "$enable_ssh_agent_u2f" = yes)
 
 
 #
